@@ -88,7 +88,11 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    // CIS AWS 3.11 — encrypt topic messages at rest. The AWS-managed SNS key
+    // covers this control without provisioning a customer-managed CMK.
+    kmsMasterKeyId: "alias/aws/sns",
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -164,6 +168,17 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS 3.11 — encrypt bucket contents at rest. The AWS-managed S3 key
+// covers this control without provisioning a customer-managed CMK.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "aws:kms",
+        },
+    }],
+});
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -183,6 +198,18 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS 3.11 — encrypt storage at rest. The AWS-managed RDS key covers
+    // this control without provisioning a customer-managed CMK.
+    storageEncrypted: true,
+    // CIS AWS 3.8 — export engine logs for audit visibility.
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
+    // CIS AWS 11.2 — automated backups. Default is 0 (disabled); 7 days is
+    // the minimum useful window for a demo instance.
+    backupRetentionPeriod: 7,
+    // CIS AWS 12.2 — high availability and protection against accidental
+    // deletion.
+    multiAz: true,
+    deletionProtection: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
