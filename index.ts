@@ -108,17 +108,13 @@ const dlq = new aws.sqs.Queue("payment-dlq", {
 });
 
 const paymentQueue = new aws.sqs.Queue("payment-queue", {
-    // FAULT 1 — maxReceiveCount of 1.
-    // A single transient failure sends the message straight to the dead-letter
-    // queue; there is no retry at all. Visible in one look at the redrive policy.
-    //
-    // It is also what makes the demo fast: Engin's measured run took 3m45s to
-    // reach the DLQ with maxReceiveCount 3. At 1, with the short visibility
-    // timeout below, it is seconds. The bug Neo diagnoses is the same property
-    // that makes the beat presentable — and the fix lands as a PR, not live.
+    // Allow a handful of transient failures (e.g. a momentary downstream
+    // blip) to be retried before a message is dead-lettered. maxReceiveCount
+    // of 1 sent every single failure straight to the DLQ with no retry at
+    // all, which is what paged Payments on Sep 2.
     redrivePolicy: pulumi.jsonStringify({
         deadLetterTargetArn: dlq.arn,
-        maxReceiveCount: 1,
+        maxReceiveCount: 5,
     }),
     visibilityTimeoutSeconds: 5,
 });
