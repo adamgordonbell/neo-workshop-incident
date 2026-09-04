@@ -108,19 +108,14 @@ const dlq = new aws.sqs.Queue("payment-dlq", {
 });
 
 const paymentQueue = new aws.sqs.Queue("payment-queue", {
-    // FAULT 1 — maxReceiveCount of 1.
-    // A single transient failure sends the message straight to the dead-letter
-    // queue; there is no retry at all. Visible in one look at the redrive policy.
-    //
-    // It is also what makes the demo fast: Engin's measured run took 3m45s to
-    // reach the DLQ with maxReceiveCount 3. At 1, with the short visibility
-    // timeout below, it is seconds. The bug Neo diagnoses is the same property
-    // that makes the beat presentable — and the fix lands as a PR, not live.
+    // A transient failure now gets retried before landing in the DLQ, and
+    // consumers get a realistic window to finish processing before the
+    // message becomes visible again for another receive.
     redrivePolicy: pulumi.jsonStringify({
         deadLetterTargetArn: dlq.arn,
-        maxReceiveCount: 1,
+        maxReceiveCount: 5,
     }),
-    visibilityTimeoutSeconds: 5,
+    visibilityTimeoutSeconds: 30,
 });
 
 const dlqAlarm = new aws.cloudwatch.MetricAlarm("payment-dlq-alarm", {
@@ -185,6 +180,35 @@ const db = new aws.rds.Instance("payments-db", {
     publiclyAccessible: false,
 });
 
+// ---------------------------------------------------------------------------
+// Adopted: a security group attached to the database out-of-band
+// ---------------------------------------------------------------------------
+
+// Discovered attached to payments-db but absent from every stack's state
+// (verified via `pulumi stack --show-urns` and an org-wide resource search).
+// Tagged `CreatedBy=console` — created directly via the AWS CLI/console during
+// a prior incident and never cleaned up. It allowed tcp/5432 from 0.0.0.0/0.
+//
+// payments-db has publiclyAccessible: false, so this was not internet-reachable
+// today, but it is a defense-in-depth gap and one flag flip from exploitable.
+// Adopting it here (rather than deleting) brings it under IaC management and
+// narrows the rule to the VPC's own CIDR, which is all it should ever need.
+// name/description/vpcId must match the live resource exactly: AWS has no
+// update API for them, so a mismatch here would force a replace on import.
+const dbVpcCidr = "172.31.0.0/16"; // payments-db's VPC (vpc-0a492476bff009509); this program does not define a VPC of its own.
+
+const dbEmergencyAccess = new aws.ec2.SecurityGroup("payments-db-emergency-access", {
+    name: "payments-db-emergency-access",
+    description: "temp access for payment incident - REMOVE AFTER",
+    vpcId: "vpc-0a492476bff009509",
+    ingress: [{
+        protocol: "tcp",
+        fromPort: 5432,
+        toPort: 5432,
+        cidrBlocks: [dbVpcCidr],
+    }],
+}, { import: "sg-0a2bbc758d70548c1" });
+
 export const paymentQueueUrl = paymentQueue.url;
 export const dlqUrl = dlq.url;
 export const dlqArn = dlq.arn;
@@ -192,3 +216,4 @@ export const alarmName = dlqAlarm.name;
 export const dbIdentifier = db.identifier;
 export const pagerdutyServiceUrl = paymentService.htmlUrl;
 export const stagingBucketName = stagingBucket.bucket;
+export const dbEmergencyAccessSgId = dbEmergencyAccess.id;
