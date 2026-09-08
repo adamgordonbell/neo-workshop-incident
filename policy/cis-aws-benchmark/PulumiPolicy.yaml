@@ -1,0 +1,6 @@
+runtime: nodejs
+name: cis-aws-benchmark
+description: >-
+  Diagnostic-only CIS AWS benchmark pack (Pulumi compliance-ready-policies,
+  advisory mode) used to evaluate this stack. Not intended for permanent
+  enforcement.
