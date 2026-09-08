@@ -104,7 +104,11 @@ const dlq = new aws.sqs.Queue("payment-dlq", {
 const paymentQueue = new aws.sqs.Queue("payment-queue", {
     redrivePolicy: pulumi.jsonStringify({
         deadLetterTargetArn: dlq.arn,
-        maxReceiveCount: 1,
+        // Allow a few transient-failure retries before dead-lettering, so a
+        // momentary consumer hiccup doesn't immediately page. Malformed
+        // messages still end up in the DLQ for later review; they just take
+        // a few more receive attempts to get there.
+        maxReceiveCount: 5,
     }),
     visibilityTimeoutSeconds: 5,
 });
