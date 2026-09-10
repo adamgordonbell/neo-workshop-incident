@@ -147,6 +147,33 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations Benchmark S3.1/S3.8: block public access settings must
+// be explicitly enabled on the bucket, not left to account-level defaults.
+const stagingBucketPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations Benchmark S3.5: the bucket must require requests to
+// use SSL/TLS. Deny any request where SecureTransport is false.
+new aws.s3.BucketPolicy("payments-staging-require-ssl", {
+    bucket: stagingBucket.id,
+    policy: stagingBucket.arn.apply((arn) => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [arn, `${arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    })),
+}, { dependsOn: [stagingBucketPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +189,9 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations Benchmark RDS.3: DB instances must have
+    // encryption at rest enabled. Defaults to false if unset.
+    storageEncrypted: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
