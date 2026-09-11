@@ -9,5 +9,6 @@ config:
   # pagerduty:token is set per-stack: pulumi config set --secret pagerduty:token
   neo-workshop-incident:pagerdutyEmail:
     description: Email for the PagerDuty users this program creates. Must be on a domain your account accepts.
+    default: workshop@example.com
   aws:region:
     value: ca-central-1

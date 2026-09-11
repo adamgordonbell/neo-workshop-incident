@@ -145,7 +145,26 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Where the payments team stages report exports before publishing. No
 // versioning: an overwritten export is gone. (The Linear ticket in the
 // workshop's "ask" demo asks for exactly that one-line fix.)
-const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+const stagingBucket = new aws.s3.Bucket("payments-staging", {
+    // CIS AWS 2.1.1: Ensure all S3 buckets employ encryption-at-rest.
+    serverSideEncryptionConfiguration: {
+        rule: {
+            applyServerSideEncryptionByDefault: {
+                sseAlgorithm: "aws:kms",
+            },
+            bucketKeyEnabled: true,
+        },
+    },
+});
+
+// CIS AWS 2.1.5: Ensure S3 bucket access control — block all public access.
+new aws.s3.BucketPublicAccessBlock("payments-staging-public-access-block", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+}, { parent: stagingBucket });
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +181,8 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS 2.3.1: Ensure that encryption-at-rest is enabled for RDS instances.
+    storageEncrypted: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
