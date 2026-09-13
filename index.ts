@@ -147,9 +147,70 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations Benchmark S3.1 / S3.8: bucket had no Block Public
+// Access configuration.
+const stagingBucketPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// Explicit default encryption at rest for staging exports.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "AES256",
+        },
+    }],
+});
+
+// CIS AWS Foundations Benchmark S3.5: bucket had no policy denying
+// non-TLS requests.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingBucketPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
+
+// The program never declared network access for payments-db, so it fell
+// back to the account's default VPC security group -- a shared, implicit
+// resource rather than a dedicated least-privilege one. Give the database
+// its own security group scoped to Postgres traffic from inside the VPC.
+const defaultVpc = aws.ec2.getVpcOutput({ default: true });
+
+const dbSecurityGroup = new aws.ec2.SecurityGroup("payments-db", {
+    description: "Postgres access for payments-db",
+    vpcId: defaultVpc.id,
+    ingress: [{
+        description: "Postgres from within the VPC",
+        protocol: "tcp",
+        fromPort: 5432,
+        toPort: 5432,
+        cidrBlocks: [defaultVpc.cidrBlock],
+    }],
+    egress: [{
+        protocol: "-1",
+        fromPort: 0,
+        toPort: 0,
+        cidrBlocks: ["0.0.0.0/0"],
+    }],
+});
 
 const db = new aws.rds.Instance("payments-db", {
     engine: "postgres",
@@ -162,6 +223,13 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    vpcSecurityGroupIds: [dbSecurityGroup.id],
+    // CIS AWS Foundations Benchmark RDS.3: encryption at rest was not enabled.
+    storageEncrypted: true,
+    // CIS AWS Foundations Benchmark RDS.13: auto minor version upgrades were
+    // not explicitly enabled; set explicitly rather than relying on the
+    // provider default.
+    autoMinorVersionUpgrade: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
