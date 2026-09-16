@@ -147,6 +147,35 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations Benchmark v3.0.0 [S3.1]/[S3.8]: block public access
+// explicitly rather than relying on the account-level default.
+const stagingBucketPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-pab", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations Benchmark v3.0.0 [S3.5]: deny any request to this
+// bucket that doesn't use TLS.
+const stagingBucketPolicy = new aws.s3.BucketPolicy("payments-staging-policy", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: {
+                Bool: { "aws:SecureTransport": "false" },
+            },
+        }],
+    }),
+});
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +191,9 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations Benchmark v3.0.0 [RDS.3]: encrypt storage at rest.
+    // Defaults to false if omitted.
+    storageEncrypted: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
