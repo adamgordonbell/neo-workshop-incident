@@ -82,7 +82,10 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+// CIS Controls v8.1 (3.11): encrypt the topic at rest with a KMS key.
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: "alias/aws/sns",
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -142,10 +145,103 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Staging assets
 // ---------------------------------------------------------------------------
 
-// Where the payments team stages report exports before publishing. No
-// versioning: an overwritten export is gone. (The Linear ticket in the
-// workshop's "ask" demo asks for exactly that one-line fix.)
+// Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+
+// CIS Controls v8.1 (3.11 / 11.2): encrypt at rest and keep prior versions
+// recoverable so an overwritten export isn't gone for good.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "aws:kms",
+            kmsMasterKeyId: "alias/aws/s3",
+        },
+        bucketKeyEnabled: true,
+    }],
+});
+
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: {
+        status: "Enabled",
+    },
+});
+
+// CIS Controls v8.1 (3.3): block all public access at the bucket level.
+new aws.s3.BucketPublicAccessBlock("payments-staging-public-access-block", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS Controls v8.1 (3.1): deny any request to the bucket that isn't over TLS.
+new aws.s3.BucketPolicy("payments-staging-ssl-only", {
+    bucket: stagingBucket.id,
+    policy: stagingBucket.arn.apply(arn => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [arn, `${arn}/*`],
+            Condition: {
+                Bool: { "aws:SecureTransport": "false" },
+            },
+        }],
+    })),
+});
+
+// CIS Controls v8.1 (3.8): access logging for the staging bucket, delivered
+// to a dedicated log bucket (kept minimal — encrypted and non-public, but not
+// itself re-logged, to avoid an infinite chain of log buckets).
+const currentAccount = aws.getCallerIdentityOutput({});
+
+const stagingLogsBucket = new aws.s3.Bucket("payments-staging-logs", {});
+
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-logs-encryption", {
+    bucket: stagingLogsBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+    }],
+});
+
+new aws.s3.BucketPublicAccessBlock("payments-staging-logs-public-access-block", {
+    bucket: stagingLogsBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+new aws.s3.BucketPolicy("payments-staging-logs-delivery", {
+    bucket: stagingLogsBucket.id,
+    policy: pulumi.all([stagingLogsBucket.arn, stagingBucket.arn, currentAccount.accountId]).apply(
+        ([logsArn, sourceArn, accountId]) => JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [{
+                Sid: "S3ServerAccessLogsPolicy",
+                Effect: "Allow",
+                Principal: { Service: "logging.s3.amazonaws.com" },
+                Action: "s3:PutObject",
+                Resource: `${logsArn}/*`,
+                Condition: {
+                    ArnLike: { "aws:SourceArn": sourceArn },
+                    StringEquals: { "aws:SourceAccount": accountId },
+                },
+            }],
+        }),
+    ),
+});
+
+new aws.s3.BucketLoggingV2("payments-staging-logging", {
+    bucket: stagingBucket.id,
+    targetBucket: stagingLogsBucket.id,
+    targetPrefix: "payments-staging/",
+});
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +258,22 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS Controls v8.1 (3.11): encrypt storage at rest. Note: this forces a
+    // replace on an already-deployed instance, since encryption cannot be
+    // enabled in place.
+    storageEncrypted: true,
+    // CIS Controls v8.1 (11.2): automated backups, 7-day retention.
+    backupRetentionPeriod: 7,
+    // CIS Controls v8.1 (3.8): ship engine logs to CloudWatch Logs.
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
+    // CIS Controls v8.1 (12.2): deletion protection. NOTE: the workshop's
+    // teardown (`pulumi destroy`) will fail while this is true — disable it
+    // first (`pulumi config set` a lower value or an `up` with this flipped
+    // to false) before tearing the demo stack down.
+    deletionProtection: true,
+    // CIS Controls v8.1 (12.2): Multi-AZ failover for availability. Doubles
+    // the RDS cost for this instance class.
+    multiAz: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
