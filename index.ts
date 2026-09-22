@@ -147,6 +147,32 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations Benchmark S3.1 / S3.8: block public access at the
+// bucket level.
+const stagingBucketPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-pab", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations Benchmark S3.5: require TLS for all requests.
+const stagingBucketPolicy = new aws.s3.BucketPolicy("payments-staging-policy", {
+    bucket: stagingBucket.id,
+    policy: stagingBucket.arn.apply((arn) => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [arn, `${arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    })),
+});
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +188,8 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations Benchmark RDS.3: encrypt storage at rest.
+    storageEncrypted: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
