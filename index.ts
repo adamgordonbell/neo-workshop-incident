@@ -82,7 +82,12 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    // CIS AWS Foundations Benchmark (sns-kms-encryption-enabled): encrypt
+    // topic messages at rest. The AWS-managed SNS key avoids provisioning a
+    // dedicated CMK for a single demo topic.
+    kmsMasterKeyId: "alias/aws/sns",
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -142,10 +147,128 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Staging assets
 // ---------------------------------------------------------------------------
 
-// Where the payments team stages report exports before publishing. No
-// versioning: an overwritten export is gone. (The Linear ticket in the
-// workshop's "ask" demo asks for exactly that one-line fix.)
+// Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+
+// CIS AWS Foundations Benchmark (s3-bucket-versioning-enabled): an
+// overwritten export used to be gone for good. See PUL-5.
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: {
+        status: "Enabled",
+    },
+});
+
+// CIS AWS Foundations Benchmark (s3-bucket-encryption): encrypt staged
+// exports at rest.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "AES256",
+        },
+    }],
+});
+
+// CIS AWS Foundations Benchmark (s3-bucket-level-public-access-prohibited).
+new aws.s3.BucketPublicAccessBlock("payments-staging-public-access-block", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations Benchmark (s3-bucket-logging-enabled): a dedicated
+// target bucket for access logs, secured the same way.
+const stagingLogsBucket = new aws.s3.Bucket("payments-staging-logs", {});
+
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-logs-encryption", {
+    bucket: stagingLogsBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "AES256",
+        },
+    }],
+});
+
+new aws.s3.BucketPublicAccessBlock("payments-staging-logs-public-access-block", {
+    bucket: stagingLogsBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+const currentAccount = aws.getCallerIdentityOutput({});
+
+// Grant the S3 log delivery service permission to write into the log
+// bucket, scoped to this account and this source bucket only.
+const stagingLogsDeliveryPolicy = aws.iam.getPolicyDocumentOutput({
+    statements: [{
+        sid: "AllowS3AccessLogDelivery",
+        effect: "Allow",
+        principals: [{
+            type: "Service",
+            identifiers: ["logging.s3.amazonaws.com"],
+        }],
+        actions: ["s3:PutObject"],
+        resources: [pulumi.interpolate`${stagingLogsBucket.arn}/payments-staging/*`],
+        conditions: [
+            {
+                test: "StringEquals",
+                variable: "aws:SourceAccount",
+                values: [currentAccount.accountId],
+            },
+            {
+                test: "ArnLike",
+                variable: "aws:SourceArn",
+                values: [stagingBucket.arn],
+            },
+        ],
+    }, {
+        sid: "DenyInsecureTransport",
+        effect: "Deny",
+        principals: [{ type: "*", identifiers: ["*"] }],
+        actions: ["s3:*"],
+        resources: [stagingLogsBucket.arn, pulumi.interpolate`${stagingLogsBucket.arn}/*`],
+        conditions: [{
+            test: "Bool",
+            variable: "aws:SecureTransport",
+            values: ["false"],
+        }],
+    }],
+});
+
+new aws.s3.BucketPolicy("payments-staging-logs-policy", {
+    bucket: stagingLogsBucket.id,
+    policy: stagingLogsDeliveryPolicy.json,
+});
+
+new aws.s3.BucketLoggingV2("payments-staging-logging", {
+    bucket: stagingBucket.id,
+    targetBucket: stagingLogsBucket.id,
+    targetPrefix: "payments-staging/",
+});
+
+// CIS AWS Foundations Benchmark (s3-bucket-ssl-enforcement-required): deny
+// any request to the staging bucket that does not use TLS.
+new aws.s3.BucketPolicy("payments-staging-ssl-enforcement", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: {
+                Bool: { "aws:SecureTransport": "false" },
+            },
+        }],
+    }),
+});
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +285,19 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations Benchmark (rds-encryption-enabled): encrypt
+    // storage at rest with the AWS-managed RDS key.
+    storageEncrypted: true,
+    // CIS AWS Foundations Benchmark (rds-instance-deletion-protection-enabled).
+    // Note: this must be disabled before `pulumi destroy` can remove the
+    // instance, so workshop teardown needs an update step first.
+    deletionProtection: true,
+    // CIS AWS Foundations Benchmark (rds-db-instance-backup-enabled): retain
+    // automated backups instead of the implicit zero-day default.
+    backupRetentionPeriod: 7,
+    // CIS AWS Foundations Benchmark (rds-instance-logging-enabled): ship
+    // database logs to CloudWatch for monitoring and audit.
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
