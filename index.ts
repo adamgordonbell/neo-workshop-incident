@@ -147,6 +147,35 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations Benchmark S3.1/S3.8: block public access at the
+// bucket level. Nothing about this bucket's use case needs public access.
+new aws.s3.BucketPublicAccessBlock("payments-staging", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations Benchmark S3.5: deny any request to the bucket that
+// isn't made over TLS.
+new aws.s3.BucketPolicy("payments-staging", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: {
+                Bool: { "aws:SecureTransport": "false" },
+            },
+        }],
+    }),
+});
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +191,10 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations Benchmark RDS.3: encryption at rest is off by
+    // default. storageEncrypted can't be changed after creation without a
+    // replacement, so setting it now avoids that later.
+    storageEncrypted: true,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
