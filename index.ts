@@ -147,6 +147,39 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS 2.1.x: encrypt at rest (SSE-S3).
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+    }],
+});
+
+// CIS AWS 2.1.4: block all public access.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS 2.1.1: deny requests that do not use TLS.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -159,6 +192,11 @@ const db = new aws.rds.Instance("payments-db", {
     dbName: "payments",
     username: "payments",
     manageMasterUserPassword: true,
+    // CIS AWS 2.3.1: encrypt RDS storage at rest. NOTE: changing this on an
+    // already-deployed instance forces replacement.
+    storageEncrypted: true,
+    // Keep automated backups (pack: rds-db-instance-backup-enabled).
+    backupRetentionPeriod: 7,
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
