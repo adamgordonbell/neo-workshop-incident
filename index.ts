@@ -13,6 +13,7 @@ import * as pulumi from "@pulumi/pulumi";
 
 const cfg = new pulumi.Config();
 const contactEmail = cfg.get("pagerdutyEmail") ?? "workshop@example.com";
+const dbDeletionProtection = cfg.getBoolean("dbDeletionProtection") ?? true;
 
 // ---------------------------------------------------------------------------
 // On-call: who gets woken up
@@ -147,6 +148,32 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS Foundations 2.1.4: block all forms of public access to the bucket.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS Foundations 2.1.1: deny any request that does not use TLS. Depends on
+// the public access block because S3 rejects concurrent bucket-level writes.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +189,12 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS Foundations 2.2.1: encrypt storage at rest. Changing this on an
+    // existing instance forces replacement.
+    storageEncrypted: true,
+    // Guard against accidental deletion. Set `dbDeletionProtection` to false
+    // (and run `pulumi up`) before `pulumi destroy` between rehearsals.
+    deletionProtection: dbDeletionProtection,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
