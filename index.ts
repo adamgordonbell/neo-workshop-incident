@@ -145,6 +145,15 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS: block all public access on the bucket.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
 // CIS: server-side encryption at rest (S3 bucket encryption).
 new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
     bucket: stagingBucket.id,
@@ -160,7 +169,8 @@ new aws.s3.BucketVersioningV2("payments-staging-versioning", {
     versioningConfiguration: { status: "Enabled" },
 });
 
-// CIS: require TLS for all access to the bucket.
+// CIS: require TLS for all access to the bucket. Created after the public
+// access block; S3 rejects concurrent policy/public-access-block updates.
 new aws.s3.BucketPolicy("payments-staging-require-tls", {
     bucket: stagingBucket.id,
     policy: pulumi.jsonStringify({
@@ -174,7 +184,7 @@ new aws.s3.BucketPolicy("payments-staging-require-tls", {
             Condition: { Bool: { "aws:SecureTransport": "false" } },
         }],
     }),
-});
+}, { dependsOn: [stagingPublicAccessBlock] });
 
 // ---------------------------------------------------------------------------
 // The database behind the service
