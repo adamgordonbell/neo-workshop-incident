@@ -142,10 +142,39 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Staging assets
 // ---------------------------------------------------------------------------
 
-// Where the payments team stages report exports before publishing. No
-// versioning: an overwritten export is gone. (The Linear ticket in the
-// workshop's "ask" demo asks for exactly that one-line fix.)
+// Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+
+// CIS: server-side encryption at rest (S3 bucket encryption).
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+        bucketKeyEnabled: true,
+    }],
+});
+
+// CIS: versioning, so an overwritten export can be recovered.
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+});
+
+// CIS: require TLS for all access to the bucket.
+new aws.s3.BucketPolicy("payments-staging-require-tls", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+});
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +191,12 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS: encrypt storage at rest. Changing this on an existing instance
+    // forces a replacement, so review the preview before deploying to a stack
+    // that already has the database.
+    storageEncrypted: true,
+    // CIS: keep automated backups (7 days) so the database can be restored.
+    backupRetentionPeriod: 7,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
