@@ -82,7 +82,39 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+const accountId = aws.getCallerIdentityOutput().accountId;
+
+// CIS AWS: the topic is encrypted with a customer-managed key. The AWS-managed
+// alias/aws/sns key cannot be used here because CloudWatch alarms are unable to
+// publish to topics encrypted with it, so the key policy grants CloudWatch access.
+const alarmTopicKey = new aws.kms.Key("payment-alarms-key", {
+    description: "Encrypts the payment alarm SNS topic",
+    enableKeyRotation: true,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "EnableAccountAdministration",
+                Effect: "Allow",
+                Principal: { AWS: pulumi.interpolate`arn:aws:iam::${accountId}:root` },
+                Action: "kms:*",
+                Resource: "*",
+            },
+            {
+                Sid: "AllowCloudWatchAlarmsToPublish",
+                Effect: "Allow",
+                Principal: { Service: "cloudwatch.amazonaws.com" },
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+                Resource: "*",
+                Condition: { StringEquals: { "aws:SourceAccount": accountId } },
+            },
+        ],
+    }),
+});
+
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: alarmTopicKey.id,
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -142,10 +174,47 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Staging assets
 // ---------------------------------------------------------------------------
 
-// Where the payments team stages report exports before publishing. No
-// versioning: an overwritten export is gone. (The Linear ticket in the
-// workshop's "ask" demo asks for exactly that one-line fix.)
+// Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+
+// CIS AWS: keep prior object versions so an overwritten export is recoverable.
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+});
+
+// CIS AWS: explicit server-side encryption at rest.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+    }],
+});
+
+// CIS AWS: block every form of public access.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS: deny any request that is not made over TLS.
+new aws.s3.BucketPolicy("payments-staging-require-tls", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +231,10 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS: automated backups (point-in-time recovery) and engine logs
+    // exported to CloudWatch for audit.
+    backupRetentionPeriod: 7,
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
