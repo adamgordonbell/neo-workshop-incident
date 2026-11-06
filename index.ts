@@ -82,7 +82,38 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+const callerIdentity = aws.getCallerIdentityOutput({});
+
+// CIS: SNS topics must be encrypted with KMS. The AWS-managed key (alias/aws/sns)
+// cannot be used here: CloudWatch alarms cannot publish to a topic encrypted with
+// it. A customer-managed key whose policy trusts CloudWatch keeps the alarm path working.
+const alarmTopicKey = new aws.kms.Key("payment-alarms-key", {
+    description: "Encrypts the payment alarm SNS topic",
+    enableKeyRotation: true,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "AllowAccountAdministration",
+                Effect: "Allow",
+                Principal: { AWS: pulumi.interpolate`arn:aws:iam::${callerIdentity.accountId}:root` },
+                Action: "kms:*",
+                Resource: "*",
+            },
+            {
+                Sid: "AllowCloudWatchAlarmsToPublish",
+                Effect: "Allow",
+                Principal: { Service: "cloudwatch.amazonaws.com" },
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+                Resource: "*",
+            },
+        ],
+    }),
+});
+
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: alarmTopicKey.arn,
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -147,6 +178,38 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+        bucketKeyEnabled: true,
+    }],
+});
+
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// Deny any request that is not made over TLS.
+new aws.s3.BucketPolicy("payments-staging-ssl-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +225,9 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    storageEncrypted: true,
+    backupRetentionPeriod: 7,
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
