@@ -82,7 +82,39 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+const accountId = aws.getCallerIdentityOutput().accountId;
+
+// CIS: sns-kms-encryption-enabled. A customer-managed key is used rather than
+// alias/aws/sns because CloudWatch alarms cannot publish to a topic encrypted
+// with the AWS-managed key; the key policy grants CloudWatch what it needs.
+const alarmKey = new aws.kms.Key("payment-alarms-key", {
+    description: "Encrypts the payment alarm SNS topic",
+    enableKeyRotation: true,
+    deletionWindowInDays: 7,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "EnableAccountAdministration",
+                Effect: "Allow",
+                Principal: { AWS: pulumi.interpolate`arn:aws:iam::${accountId}:root` },
+                Action: "kms:*",
+                Resource: "*",
+            },
+            {
+                Sid: "AllowCloudWatchAlarmsToPublish",
+                Effect: "Allow",
+                Principal: { Service: "cloudwatch.amazonaws.com" },
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+                Resource: "*",
+            },
+        ],
+    }),
+});
+
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: alarmKey.arn,
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -147,9 +179,63 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS: customer-managed key for staging bucket encryption (s3-bucket-encryption
+// requires a CMK by default); rotation satisfies kms-key-rotation-enabled.
+const stagingKey = new aws.kms.Key("payments-staging-key", {
+    description: "Encrypts the payments staging bucket",
+    enableKeyRotation: true,
+    deletionWindowInDays: 7,
+});
+
+// CIS: s3-bucket-versioning-enabled. An overwritten export is now recoverable.
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+});
+
+// CIS: s3-bucket-encryption.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-encryption", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: {
+            sseAlgorithm: "aws:kms",
+            kmsMasterKeyId: stagingKey.arn,
+        },
+        bucketKeyEnabled: true,
+    }],
+});
+
+// CIS: s3-bucket-level-public-access-prohibited.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS: s3-bucket-ssl-enforcement-required. Depends on the public access block
+// because S3 rejects concurrent policy/PAB writes on one bucket.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: stagingBucket.arn.apply(arn => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [arn, `${arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    })),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
+
+const dbDeletionProtection = cfg.getBoolean("dbDeletionProtection") ?? true;
 
 const db = new aws.rds.Instance("payments-db", {
     engine: "postgres",
@@ -162,6 +248,15 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS: rds-encryption-enabled.
+    storageEncrypted: true,
+    // CIS: rds-db-instance-backup-enabled.
+    backupRetentionPeriod: 7,
+    // CIS: rds-logging-enabled.
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
+    // CIS: rds-instance-deletion-protection-enabled. Set the
+    // dbDeletionProtection config to false (and run an update) before destroy.
+    deletionProtection: dbDeletionProtection,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
