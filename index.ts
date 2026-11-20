@@ -147,6 +147,55 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS hardening for the staging bucket.
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+});
+
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+        bucketKeyEnabled: true,
+    }],
+});
+
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// Deny any request that is not over TLS 1.2+. Depends on the public access
+// block so the two bucket-level settings are not applied concurrently.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "DenyInsecureTransport",
+                Effect: "Deny",
+                Principal: "*",
+                Action: "s3:*",
+                Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+                Condition: { Bool: { "aws:SecureTransport": "false" } },
+            },
+            {
+                Sid: "DenyOldTls",
+                Effect: "Deny",
+                Principal: "*",
+                Action: "s3:*",
+                Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+                Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } },
+            },
+        ],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +211,11 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS hardening. Note: toggling storageEncrypted on an existing
+    // instance forces replacement.
+    storageEncrypted: true,
+    backupRetentionPeriod: 7,
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
