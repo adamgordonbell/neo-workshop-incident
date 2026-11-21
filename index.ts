@@ -82,7 +82,39 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+// CIS: the topic is encrypted with a customer-managed key. CloudWatch alarms
+// cannot publish to a topic encrypted with the AWS-managed alias/aws/sns key,
+// so the key policy grants the CloudWatch service principal access explicitly.
+const accountId = aws.getCallerIdentityOutput().accountId;
+
+const alarmTopicKey = new aws.kms.Key("payment-alarms-key", {
+    description: "Encrypts the payment alarm SNS topic",
+    enableKeyRotation: true,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "EnableAccountAdministration",
+                Effect: "Allow",
+                Principal: { AWS: pulumi.interpolate`arn:aws:iam::${accountId}:root` },
+                Action: "kms:*",
+                Resource: "*",
+            },
+            {
+                Sid: "AllowCloudWatchAlarmsToPublish",
+                Effect: "Allow",
+                Principal: { Service: "cloudwatch.amazonaws.com" },
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+                Resource: "*",
+                Condition: { StringEquals: { "aws:SourceAccount": accountId } },
+            },
+        ],
+    }),
+});
+
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: alarmTopicKey.keyId,
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -147,6 +179,51 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS: encrypt objects at rest (SSE-S3).
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+        bucketKeyEnabled: true,
+    }],
+});
+
+// CIS: block every form of public access.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-pab", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS: deny any request that is not made over TLS 1.2 or newer. Depends on the
+// public access block so the two don't race on the bucket's policy settings.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "DenyInsecureTransport",
+                Effect: "Deny",
+                Principal: "*",
+                Action: "s3:*",
+                Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+                Condition: { Bool: { "aws:SecureTransport": "false" } },
+            },
+            {
+                Sid: "DenyOldTlsVersions",
+                Effect: "Deny",
+                Principal: "*",
+                Action: "s3:*",
+                Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+                Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } },
+            },
+        ],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +239,10 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS: encrypt storage at rest, keep automated backups, and ship engine logs.
+    storageEncrypted: true,
+    backupRetentionPeriod: 7,
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
