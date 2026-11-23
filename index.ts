@@ -99,6 +99,7 @@ new aws.sns.TopicSubscription("payment-alarms-to-pagerduty", {
 
 const dlq = new aws.sqs.Queue("payment-dlq", {
     messageRetentionSeconds: 60 * 60 * 24,
+    sqsManagedSseEnabled: true,
 });
 
 const paymentQueue = new aws.sqs.Queue("payment-queue", {
@@ -107,6 +108,7 @@ const paymentQueue = new aws.sqs.Queue("payment-queue", {
         maxReceiveCount: 1,
     }),
     visibilityTimeoutSeconds: 5,
+    sqsManagedSseEnabled: true,
 });
 
 const dlqAlarm = new aws.cloudwatch.MetricAlarm("payment-dlq-alarm", {
@@ -147,6 +149,38 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // workshop's "ask" demo asks for exactly that one-line fix.)
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
 
+// CIS AWS 2.1.1: encrypt objects at rest.
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+    }],
+});
+
+// CIS AWS 2.1.4: block all public access.
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-pab", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// CIS AWS 2.1.2: deny requests that are not made over TLS.
+new aws.s3.BucketPolicy("payments-staging-tls-only", {
+    bucket: stagingBucket.id,
+    policy: aws.iam.getPolicyDocumentOutput({
+        statements: [{
+            sid: "DenyInsecureTransport",
+            effect: "Deny",
+            principals: [{ type: "*", identifiers: ["*"] }],
+            actions: ["s3:*"],
+            resources: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            conditions: [{ test: "Bool", variable: "aws:SecureTransport", values: ["false"] }],
+        }],
+    }).json,
+}, { dependsOn: [stagingPublicAccessBlock] });
+
 // ---------------------------------------------------------------------------
 // The database behind the service
 // ---------------------------------------------------------------------------
@@ -162,6 +196,12 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // CIS AWS 2.3.1: encrypt the instance's storage at rest.
+    storageEncrypted: true,
+    // CIS AWS 2.3.2: apply minor engine upgrades automatically.
+    autoMinorVersionUpgrade: true,
+    // Keep automated backups (a retention of 0 disables them).
+    backupRetentionPeriod: 7,
 });
 
 export const paymentQueueUrl = paymentQueue.url;
