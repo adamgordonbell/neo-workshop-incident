@@ -82,7 +82,39 @@ const cloudwatchIntegration = new pagerduty.ServiceIntegration("payments-cloudwa
 // The alerting path: alarm -> SNS -> PagerDuty
 // ---------------------------------------------------------------------------
 
-const alarmTopic = new aws.sns.Topic("payment-alarms", {});
+// Customer-managed key for the alarm topic (CIS 3.11). CloudWatch alarms cannot
+// publish to a topic encrypted with the AWS-managed alias/aws/sns key, so the
+// key policy explicitly lets the CloudWatch service use it.
+const accountId = aws.getCallerIdentityOutput().accountId;
+
+const alarmTopicKey = new aws.kms.Key("payment-alarms-key", {
+    description: "Encrypts the payment alarm SNS topic",
+    enableKeyRotation: true,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [
+            {
+                Sid: "AccountAdministration",
+                Effect: "Allow",
+                Principal: { AWS: pulumi.interpolate`arn:aws:iam::${accountId}:root` },
+                Action: "kms:*",
+                Resource: "*",
+            },
+            {
+                Sid: "AllowCloudWatchAlarms",
+                Effect: "Allow",
+                Principal: { Service: "cloudwatch.amazonaws.com" },
+                Action: ["kms:Decrypt", "kms:GenerateDataKey*"],
+                Resource: "*",
+                Condition: { StringEquals: { "aws:SourceAccount": accountId } },
+            },
+        ],
+    }),
+});
+
+const alarmTopic = new aws.sns.Topic("payment-alarms", {
+    kmsMasterKeyId: alarmTopicKey.arn,
+});
 
 // The integration key is minted by PagerDuty and consumed here, so Pulumi will
 // not create the subscription before the integration exists. No copy-paste step.
@@ -142,10 +174,49 @@ new aws.cloudwatch.MetricAlarm("payment-queue-age-alarm", {
 // Staging assets
 // ---------------------------------------------------------------------------
 
-// Where the payments team stages report exports before publishing. No
-// versioning: an overwritten export is gone. (The Linear ticket in the
-// workshop's "ask" demo asks for exactly that one-line fix.)
+// Where the payments team stages report exports before publishing.
 const stagingBucket = new aws.s3.Bucket("payments-staging", {});
+
+// Versioning, so an overwritten export can be recovered (CIS 11.2).
+new aws.s3.BucketVersioningV2("payments-staging-versioning", {
+    bucket: stagingBucket.id,
+    versioningConfiguration: { status: "Enabled" },
+});
+
+// Encryption at rest with S3-managed keys (CIS 3.11).
+new aws.s3.BucketServerSideEncryptionConfigurationV2("payments-staging-sse", {
+    bucket: stagingBucket.id,
+    rules: [{
+        applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+        bucketKeyEnabled: true,
+    }],
+});
+
+// Block every form of public access (CIS 3.3).
+const stagingPublicAccessBlock = new aws.s3.BucketPublicAccessBlock("payments-staging-public-access", {
+    bucket: stagingBucket.id,
+    blockPublicAcls: true,
+    blockPublicPolicy: true,
+    ignorePublicAcls: true,
+    restrictPublicBuckets: true,
+});
+
+// Deny any request that is not made over TLS (CIS 3.1). Depends on the public
+// access block so the two bucket-level settings are not applied concurrently.
+new aws.s3.BucketPolicy("payments-staging-ssl-only", {
+    bucket: stagingBucket.id,
+    policy: pulumi.jsonStringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "DenyInsecureTransport",
+            Effect: "Deny",
+            Principal: "*",
+            Action: "s3:*",
+            Resource: [stagingBucket.arn, pulumi.interpolate`${stagingBucket.arn}/*`],
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+        }],
+    }),
+}, { dependsOn: [stagingPublicAccessBlock] });
 
 // ---------------------------------------------------------------------------
 // The database behind the service
@@ -162,6 +233,13 @@ const db = new aws.rds.Instance("payments-db", {
     skipFinalSnapshot: true,
     applyImmediately: true,
     publiclyAccessible: false,
+    // Encryption at rest (CIS 3.11). Changing this on an existing instance
+    // forces replacement.
+    storageEncrypted: true,
+    // Automated backups (CIS 11.2).
+    backupRetentionPeriod: 7,
+    // Ship engine logs to CloudWatch for audit (CIS 3.8).
+    enabledCloudwatchLogsExports: ["postgresql", "upgrade"],
 });
 
 export const paymentQueueUrl = paymentQueue.url;
